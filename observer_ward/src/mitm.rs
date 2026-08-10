@@ -171,6 +171,7 @@ impl engine::slinger_mitm::Interceptor for FingerprintInterceptor {
           let execute_result = crate::FingerprintResult {
             task_id: None,
             target: target.to_string(),
+            input_target: target.to_string(),
             matched: vec![entry],
             success: true,
             record: None,

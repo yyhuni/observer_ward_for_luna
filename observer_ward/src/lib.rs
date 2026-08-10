@@ -591,6 +591,8 @@ pub struct FingerprintResult {
   pub task_id: Option<String>,
   /// Target that was scanned
   pub target: String,
+  /// Input text associated with this result
+  pub input_target: String,
   /// Matched fingerprint results as a list of MatchedEntry
   pub matched: Vec<MatchedEntry>,
   /// http record
@@ -617,20 +619,20 @@ impl ObserverWard {
     })
   }
   pub async fn execute(self: Arc<Self>, tx: UnboundedSender<FingerprintResult>) {
-    let input = self.config.input();
+    let input = self.config.input_candidates();
     info!("{}target loaded: {}", Emoji("🎯", ""), input.len());
     let mut worker = FuturesUnordered::new();
     let mut targets = input.into_iter();
     for _ in 0..self.config.thread {
-      if let Some(u) = targets.next() {
-        worker.push(self.run(u));
+      if let Some(candidate) = targets.next() {
+        worker.push(self.run_with_input_target(candidate.uri, candidate.input_target));
       } else {
         break;
       }
     }
     while let Some(result) = worker.next().await {
-      if let Some(u) = targets.next() {
-        worker.push(self.run(u));
+      if let Some(candidate) = targets.next() {
+        worker.push(self.run_with_input_target(candidate.uri, candidate.input_target));
       }
       tx.unbounded_send(result).unwrap_or_default();
     }
@@ -748,6 +750,16 @@ impl ObserverWard {
     }
   }
   pub async fn run(&self, target: Uri) -> FingerprintResult {
+    let input_target = target.to_string();
+    self.run_with_input_target(target, input_target).await
+  }
+
+  // Input text is result metadata only; scanning continues to use the parsed Uri.
+  pub(crate) async fn run_with_input_target(
+    &self,
+    target: Uri,
+    input_target: String,
+  ) -> FingerprintResult {
     debug!("{}: {}", Emoji("🚦", "start"), target);
     let mut runner = ClusterExecuteRunner::new(&target);
     match target.scheme_str() {
@@ -774,6 +786,7 @@ impl ObserverWard {
           return FingerprintResult {
             task_id: None,
             target: target.to_string(),
+            input_target,
             matched: runner
               .matched_result
               .into_iter()
@@ -810,6 +823,7 @@ impl ObserverWard {
     FingerprintResult {
       task_id: None,
       target: target.to_string(),
+      input_target,
       matched: runner
         .matched_result
         .into_iter()
@@ -857,5 +871,121 @@ impl ObserverWard {
     for cluster in self.cluster_type.code.iter() {
       runner.code(cluster);
     }
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+  use crate::cli::InputCandidate;
+  use engine::execute::ClusterType;
+  use engine::slinger::http::Uri;
+  use futures::StreamExt;
+  use futures::stream::FuturesUnordered;
+  use std::str::FromStr;
+  use std::task::Poll;
+
+  fn test_config() -> ObserverWardConfig {
+    serde_json::from_value(serde_json::json!({
+      "target": [],
+      "ua": "test-agent",
+      "timeout": 1,
+      "thread": 2,
+    }))
+    .expect("test config should deserialize")
+  }
+
+  fn result_for_candidate(candidate: InputCandidate) -> FingerprintResult {
+    FingerprintResult {
+      task_id: None,
+      target: candidate.uri.to_string(),
+      input_target: candidate.input_target,
+      matched: Vec::new(),
+      record: None,
+      success: true,
+      error: None,
+    }
+  }
+
+  #[tokio::test]
+  async fn scheduled_candidates_keep_input_target_when_completion_order_reverses() {
+    let candidates = vec![
+      InputCandidate {
+        input_target: "  https://example.com/first/  ".to_string(),
+        uri: Uri::from_str("https://example.com/first/").unwrap(),
+      },
+      InputCandidate {
+        input_target: "https://example.com/second".to_string(),
+        uri: Uri::from_str("https://example.com/second").unwrap(),
+      },
+    ];
+    let mut worker = FuturesUnordered::new();
+
+    for (index, candidate) in candidates.into_iter().enumerate() {
+      worker.push(async move {
+        if index == 0 {
+          let mut first_poll = true;
+          futures::future::poll_fn(move |context| {
+            if first_poll {
+              first_poll = false;
+              context.waker().wake_by_ref();
+              Poll::Pending
+            } else {
+              Poll::Ready(())
+            }
+          })
+          .await;
+        }
+        result_for_candidate(candidate)
+      });
+    }
+
+    let mut results = Vec::new();
+    while let Some(result) = worker.next().await {
+      results.push(result);
+    }
+
+    assert_eq!(results[0].target, "https://example.com/second");
+    assert_eq!(results[0].input_target, "https://example.com/second");
+    assert_eq!(results[1].target, "https://example.com/first/");
+    assert_eq!(results[1].input_target, "  https://example.com/first/  ");
+  }
+
+  #[test]
+  fn fingerprint_result_json_includes_input_target_without_changing_existing_fields() {
+    let result = FingerprintResult {
+      task_id: Some("task-1".to_string()),
+      target: "https://example.com/app/".to_string(),
+      input_target: "  https://example.com/app/  ".to_string(),
+      matched: Vec::new(),
+      record: None,
+      success: true,
+      error: None,
+    };
+
+    let json = serde_json::to_value(result).unwrap();
+
+    assert_eq!(json["task_id"], "task-1");
+    assert_eq!(json["target"], "https://example.com/app/");
+    assert_eq!(json["input_target"], "  https://example.com/app/  ");
+    assert_eq!(json["matched"], serde_json::json!([]));
+    assert_eq!(json["success"], true);
+    assert!(json.get("record").is_none());
+    assert!(json.get("error").is_none());
+  }
+
+  #[tokio::test]
+  async fn run_uses_serialized_uri_as_input_target_without_a_raw_candidate() {
+    let observer_ward = ObserverWard::new(&test_config(), ClusterType::default());
+    let target = Uri::from_str("ftp://example.com/resource").unwrap();
+    let target_text = target.to_string();
+
+    let result = observer_ward.run(target).await;
+
+    assert_eq!(result.target, target_text);
+    assert_eq!(result.input_target, target_text);
+    assert!(result.matched.is_empty());
+    assert!(result.success);
+    assert!(result.error.is_none());
   }
 }

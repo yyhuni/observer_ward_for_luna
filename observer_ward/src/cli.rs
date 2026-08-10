@@ -301,6 +301,12 @@ pub struct ObserverWardConfig {
   pub index: bool,
 }
 
+#[derive(Debug)]
+pub(crate) struct InputCandidate {
+  pub(crate) input_target: String,
+  pub(crate) uri: Uri,
+}
+
 fn default_token() -> Option<String> {
   Some(uuid::Uuid::new_v4().to_string())
 }
@@ -456,23 +462,24 @@ impl ObserverWardConfig {
     }
   }
   pub fn input(&self) -> Vec<Uri> {
-    let i = if !self.target.is_empty() {
+    self
+      .input_candidates()
+      .into_iter()
+      .map(|candidate| candidate.uri)
+      .collect()
+  }
+
+  pub(crate) fn input_candidates(&self) -> Vec<InputCandidate> {
+    let targets = if !self.target.is_empty() {
       self.target.clone()
     } else if let Some(f) = &self.list {
       read_file_to_target(f)
     } else {
       read_from_stdio().unwrap_or_default()
     };
-    i.iter()
-      .filter_map(|target| match Uri::from_str(target.trim()) {
-        Ok(u) => Some(u),
-        Err(err) => {
-          error!("{}uri: {}, err: {}", Emoji("💢", ""), target, err);
-          None
-        }
-      })
-      .collect()
+    parse_input_candidates(targets)
   }
+
   pub fn templates(&self) -> Vec<Template> {
     let mut templates = Vec::new();
     if let Some(ts) = self.yaml_probes() {
@@ -532,6 +539,19 @@ impl ObserverWardConfig {
   }
 }
 
+fn parse_input_candidates(targets: Vec<String>) -> Vec<InputCandidate> {
+  targets
+    .into_iter()
+    .filter_map(|input_target| match Uri::from_str(input_target.trim()) {
+      Ok(uri) => Some(InputCandidate { input_target, uri }),
+      Err(err) => {
+        error!("{}uri: {}, err: {}", Emoji("💢", ""), input_target, err);
+        None
+      }
+    })
+    .collect()
+}
+
 fn has_nuclei_app() -> bool {
   if cfg!(target_os = "windows") {
     Command::new("nuclei.exe")
@@ -545,5 +565,22 @@ fn has_nuclei_app() -> bool {
       .stdin(Stdio::null())
       .output()
       .is_ok()
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::parse_input_candidates;
+
+  #[test]
+  fn input_candidates_preserve_raw_input_without_changing_uri_parsing() {
+    let candidates = parse_input_candidates(vec![
+      "  https://example.com/app/  ".to_string(),
+      "http://[::1".to_string(),
+    ]);
+
+    assert_eq!(candidates.len(), 1);
+    assert_eq!(candidates[0].input_target, "  https://example.com/app/  ");
+    assert_eq!(candidates[0].uri.to_string(), "https://example.com/app/");
   }
 }

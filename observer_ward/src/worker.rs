@@ -106,6 +106,7 @@ impl AsynqClient {
       let result = FingerprintResult {
         task_id: Some(task_id),
         target: entry.base_url.clone(),
+        input_target: entry.base_url.clone(),
         matched: vec![entry.clone()],
         success: true,
         record: None,
@@ -161,6 +162,7 @@ impl FingerprintHandler {
         return FingerprintResult {
           task_id: Some(task.task_id.clone()),
           target: target.to_string(),
+          input_target: target.to_string(),
           matched: Vec::new(),
           success: false,
           record: None,
@@ -174,7 +176,9 @@ impl FingerprintHandler {
 
     // Run fingerprint identification
     let observer_ward = ObserverWard::new(task_config, (*self.cluster_type).clone());
-    observer_ward.run(uri).await
+    observer_ward
+      .run_with_input_target(uri, target.to_string())
+      .await
   }
 
   /// Process HTTP data task (passive matching like MITM)
@@ -223,6 +227,7 @@ impl FingerprintHandler {
 
     FingerprintResult {
       task_id: Some(task.task_id.clone()),
+      input_target: target.clone(),
       target,
       matched: matched_vec,
       success: true,
@@ -334,4 +339,45 @@ pub async fn start_asynq_worker(
   server.run(handler).await?;
 
   Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  fn test_config() -> ObserverWardConfig {
+    serde_json::from_value(serde_json::json!({
+      "target": [],
+      "ua": "test-agent",
+      "timeout": 1,
+      "thread": 1,
+    }))
+    .expect("test config should deserialize")
+  }
+
+  #[tokio::test]
+  async fn invalid_uri_result_preserves_the_queue_target_as_input_target() {
+    let handler = FingerprintHandler::new(
+      test_config(),
+      ClusterType::default(),
+      None,
+      AsynqMode::Receive,
+    );
+    let task = FingerprintTask {
+      task_id: "task-1".to_string(),
+      input: TaskInput::Uri {
+        target: "http://[::1".to_string(),
+      },
+      config: None,
+    };
+
+    let result = handler.process_uri_target(&task, "http://[::1").await;
+
+    assert_eq!(result.task_id.as_deref(), Some("task-1"));
+    assert_eq!(result.target, "http://[::1");
+    assert_eq!(result.input_target, "http://[::1");
+    assert!(result.matched.is_empty());
+    assert!(!result.success);
+    assert!(result.error.is_some());
+  }
 }
